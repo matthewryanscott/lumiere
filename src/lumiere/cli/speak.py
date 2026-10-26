@@ -26,6 +26,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
+from lumiere.adapters import ollama
 from lumiere.adapters.elevenlabs import TTS_MODEL, VOICE_SETTINGS, speech_request
 from lumiere.cli.conventions import opened, read_recipe, recipe_path
 from lumiere.core.lexicon import apply_lexicon, used_entries
@@ -43,6 +44,18 @@ def _default_synthesizer(request: dict[str, Any], voice: str) -> bytes:
     return post_speech(request, load_api_key(), voice)
 
 
+def _default_ollama_synthesizer(request: dict[str, Any], voice: str) -> bytes:
+    # The voice is already in the request body when given; the host is not
+    # passed because the adapter reads OLLAMA_HOST itself.
+    from lumiere.adapters.ollama import host, post_speech
+
+    return post_speech(request, host())
+
+
+def _default_for(provider: str) -> Synthesizer:
+    return _default_ollama_synthesizer if provider == "ollama" else _default_synthesizer
+
+
 def speak(
     text: str,
     output: Path,
@@ -53,7 +66,8 @@ def speak(
     speed: float | None = None,
     force: bool = False,
     synthesizer: Synthesizer | None = None,
-    model: str = TTS_MODEL,
+    model: str | None = None,
+    provider: str = "elevenlabs",
 ) -> bool:
     """Write `output` and `output.json`; False when the companion already
     records the same text, voice, and settings and nothing was requested.
@@ -61,28 +75,36 @@ def speak(
     Raises ValueError, before any request, when `output` exists and its
     companion is malformed or records no request, unless `force`.
     """
+    if provider == "ollama":
+        model = model or ollama.DEFAULT_MODEL
+    else:
+        model = model or TTS_MODEL
     # Only the entries this text uses: one lexicon serves every part, and an
     # entry for a word not spoken here cannot change this audio.
     lexicon = used_entries(text, dict(lexicon or {}))
-    settings = {
-        "model": model,
-        "voice_settings": VOICE_SETTINGS,
-        "speed": speed,
-        "lexicon": lexicon,
-        "previous_text": previous_text,
-        "next_text": next_text,
-    }
-    request = speech_request(
-        apply_lexicon(text, lexicon), previous_text, next_text, speed, model
-    )
-    made = {"text": text, "voice": voice, "settings": settings, REQUEST: request}
+    applied_text = apply_lexicon(text, lexicon)
+    if provider == "ollama":
+        request = ollama.speech_request(applied_text, voice, model)
+        settings = {"model": model, "lexicon": lexicon}
+    else:
+        request = speech_request(applied_text, previous_text, next_text, speed, model)
+        settings = {
+            "model": model,
+            "voice_settings": VOICE_SETTINGS,
+            "speed": speed,
+            "lexicon": lexicon,
+            "previous_text": previous_text,
+            "next_text": next_text,
+        }
+    made = {"text": text, "voice": voice, "provider": provider,
+            "settings": settings, REQUEST: request}
 
     if output.exists() and not force:
         recorded = _recorded(output)
         if _comparable(recorded, text) == made:
             return False
 
-    audio = (synthesizer or _default_synthesizer)(request, voice)
+    audio = (synthesizer or _default_for(provider))(request, voice or "")
     _write_wav(audio, output)
     companion = {**made, "audio_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}
     with opened(recipe_path(output)) as stream:
@@ -95,6 +117,8 @@ def _comparable(recorded: dict[str, Any], text: str) -> dict[str, Any]:
     entries this text uses. A companion written when the whole lexicon was
     recorded then still matches, and nothing is spoken again."""
     comparable = {key: recorded.get(key) for key in ("text", "voice", "settings", REQUEST)}
+    # A companion written before providers existed speaks ElevenLabs.
+    comparable["provider"] = recorded.get("provider") or "elevenlabs"
     settings = comparable["settings"]
     if isinstance(settings, dict) and isinstance(settings.get("lexicon"), dict):
         comparable["settings"] = {**settings, "lexicon": used_entries(text, settings["lexicon"])}

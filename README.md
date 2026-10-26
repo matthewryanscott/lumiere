@@ -117,6 +117,16 @@ only the entries its text uses, so a new entry respeaks only the parts that
 say that word. `speak --model` picks the ElevenLabs model
 (default: `eleven_multilingual_v2`).
 
+`speak --provider ollama` speaks with a local Ollama speech model instead.
+It requires Ollama v0.40.9+ and `ollama pull phonon`, honors `OLLAMA_HOST`
+(default `http://localhost:11434`), and needs no API key: `--voice` names a
+local voice, as `ollama show phonon` lists them, and omitting it lets the
+model speak with its own default voice. The local model takes no `--speed`
+and no `--previous`/`--next`, and one request carries the whole text capped
+at 4,096 characters, so such an invocation refuses in one line rather than
+speak. `transcribe` and `voices` always call ElevenLabs; the `ELEVENLABS_*`
+variables are only consulted for the `elevenlabs` provider.
+
 `speak --voice` picks the voice (default: `ELEVENLABS_VOICE_ID`). `voices
 list` prints the account's voices, one JSON line each, with the labels a
 caster compares: gender, accent, age, descriptive, use case, language, a

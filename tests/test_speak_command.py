@@ -376,3 +376,216 @@ def test_bad_usage_exits_2_before_any_request(here, provider, capsys, arguments,
     assert message in capsys.readouterr().err
     assert provider.requests == []
     assert not (here / "a.wav").exists()
+
+
+# -- the ollama provider ---------------------------------------------------
+
+@pytest.fixture
+def ollama(here, monkeypatch) -> FakeProvider:
+    """Stands in for the local Ollama speech model wherever `main` reaches it."""
+    fake = FakeProvider()
+    monkeypatch.setattr(speak_module, "_default_ollama_synthesizer", fake)
+    monkeypatch.delenv("ELEVENLABS_API_KEY", raising=False)
+    monkeypatch.delenv("ELEVENLABS_VOICE_ID", raising=False)
+    return fake
+
+
+def test_the_ollama_request_carries_the_text_for_the_local_model(here, ollama):
+    """No voice, no speed, no neighbours: the model speaks with its own
+    default voice, and no ElevenLabs key is anywhere in the environment."""
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama"]) == 0
+
+    (request, voice) = ollama.requests[0]
+    assert request == {"model": "phonon", "input": "Hello.", "response_format": "wav"}
+    assert voice == ""
+    made = companion(here / "a.wav")
+    assert made["provider"] == "ollama"
+    assert made["settings"] == {"model": "phonon", "lexicon": {}}
+    assert made["request"] == request
+
+
+def test_an_ollama_voice_is_optional_and_goes_in_the_request_body(here, ollama):
+    assert main([
+        "speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--voice", "Zoey",
+    ]) == 0
+
+    (request, voice) = ollama.requests[0]
+    assert request["voice"] == "Zoey"
+    assert voice == "Zoey"
+    assert companion(here / "a.wav")["request"] == request
+
+
+def test_without_a_voice_the_recipe_records_null(here, ollama):
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama"]) == 0
+
+    assert "voice" not in ollama.requests[0][0]
+    assert companion(here / "a.wav")["voice"] is None
+
+
+def test_speed_is_refused_for_ollama_in_one_line_and_writes_nothing(here, ollama, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--speed", "1.5"])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "error: --speed is not a phonon setting; leave it out" in err
+    assert ollama.requests == []
+    assert list(here.iterdir()) == []
+
+
+@pytest.mark.parametrize("option", ["--previous", "--previous-file"])
+def test_neighbour_context_is_refused_for_ollama_in_one_line(here, ollama, capsys, option):
+    (here / "before.txt").write_text("The line before.\n")
+    arguments = ["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", option,
+                 "before.txt" if "-file" in option else "The line before."]
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(arguments)
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "error: phonon takes no neighbour context; leave out --previous and --next" in err
+    assert ollama.requests == []
+    assert [p.name for p in here.iterdir()] == ["before.txt"]
+
+
+def test_the_lexicon_respells_the_ollama_request_and_records_what_it_used(here, ollama):
+    (here / "lexicon.json").write_text(json.dumps({"Henrique": "En-hee-kee", "unused": "x"}))
+
+    assert main([
+        "speak", "Hello Henrique.", "-o", "a.wav", "--provider", "ollama",
+        "--lexicon", "lexicon.json",
+    ]) == 0
+
+    assert ollama.requests[0][0]["input"] == "Hello En-hee-kee."
+    assert companion(here / "a.wav")["settings"]["lexicon"] == {"Henrique": "En-hee-kee"}
+
+
+def test_text_over_the_request_cap_is_bad_input_in_one_line_and_writes_nothing(here, ollama, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["speak", "x" * 4097, "-o", "a.wav", "--provider", "ollama"])
+
+    assert exit_info.value.code == 2
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1
+    assert "error: 4097 characters is over the 4096 a speech request takes" in err
+    assert ollama.requests == []
+    assert list(here.iterdir()) == []
+
+
+def test_a_failed_ollama_request_exits_1_in_one_line_and_writes_nothing(here, monkeypatch, capsys):
+    def refusing(request: dict[str, Any], voice: str) -> bytes:
+        raise requests.ConnectionError("connection refused")
+
+    monkeypatch.setattr(speak_module, "_default_ollama_synthesizer", refusing)
+
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama"]) == 1
+
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err == "a.wav: the provider request failed: connection refused\n"
+    assert list(here.iterdir()) == []
+
+
+# -- the request the adapter builds ----------------------------------------
+
+def test_the_adapter_posts_to_the_default_local_host(monkeypatch):
+    from lumiere.adapters import ollama
+
+    monkeypatch.delenv("OLLAMA_HOST", raising=False)
+    (request, seen) = _record_post(monkeypatch)
+    assert ollama.post_speech(request, ollama.host()) == b"wav"
+    assert seen == {"url": "http://localhost:11434/v1/audio/speech",
+                    "json": request, "timeout": 300}
+
+
+def test_the_adapter_uses_ollama_host(monkeypatch):
+    from lumiere.adapters import ollama
+
+    monkeypatch.setenv("OLLAMA_HOST", "https://10.0.0.9:11434/")
+    assert ollama.host() == "https://10.0.0.9:11434"
+
+    (request, seen) = _record_post(monkeypatch)
+    assert ollama.post_speech(request, ollama.host()) == b"wav"
+    assert seen == {"url": "https://10.0.0.9:11434/v1/audio/speech",
+                    "json": request, "timeout": 300}
+
+
+def test_a_schemeless_ollama_host_gets_http(monkeypatch):
+    from lumiere.adapters import ollama
+
+    monkeypatch.setenv("OLLAMA_HOST", "10.0.0.9:11434")
+    assert ollama.host() == "http://10.0.0.9:11434"
+
+
+def test_text_over_the_cap_raises_before_any_post(monkeypatch):
+    from lumiere.adapters import ollama
+
+    _record_post(monkeypatch)
+    with pytest.raises(ollama.TooLong):
+        ollama.speech_request("x" * 4097, None, ollama.DEFAULT_MODEL)
+
+
+def _record_post(monkeypatch) -> tuple[dict, dict[str, Any]]:
+    """Patches `requests.post` in the ollama adapter; returns what it saw."""
+    from lumiere.adapters import ollama
+
+    seen: dict[str, Any] = {}
+
+    def fake_post(url: str, json: dict | None = None, timeout: int | None = None, **kwargs):
+        seen["url"] = url
+        seen["json"] = json
+        seen["timeout"] = timeout
+
+        class Response:
+            content = b"wav"
+
+            def raise_for_status(self) -> None:
+                pass
+
+        return Response()
+
+    monkeypatch.setattr(ollama.requests, "post", fake_post)
+    return ({"model": "phonon", "input": "Hello.", "response_format": "wav"}, seen)
+
+
+# -- skipping across providers ---------------------------------------------
+
+def test_the_same_ollama_invocation_makes_no_second_request(here, ollama, capsys):
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--voice", "Zoey"]) == 0
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--voice", "Zoey"]) == 0
+
+    assert len(ollama.requests) == 1
+    assert "unchanged" in capsys.readouterr().err
+
+
+def test_a_companion_without_a_provider_still_skips_elevenlabs(here, provider):
+    """Companions written before providers existed speak ElevenLabs."""
+    from lumiere.adapters.elevenlabs import TTS_MODEL, VOICE_SETTINGS, speech_request
+    from lumiere.cli.speak import REQUEST
+
+    (here / "a.wav").write_bytes(wav_bytes(10))
+    (here / "a.wav.json").write_text(json.dumps({
+        "text": "Hello.", "voice": VOICE,
+        "settings": {"model": TTS_MODEL, "voice_settings": VOICE_SETTINGS,
+                     "speed": None, "lexicon": {}, "previous_text": "", "next_text": ""},
+        REQUEST: speech_request("Hello.", "", "", None, TTS_MODEL),
+        "audio_sha256": "0" * 64,
+    }, indent=2) + "\n")
+
+    assert main(["speak", "Hello.", "-o", "a.wav", "--voice", VOICE]) == 0
+    assert provider.requests == []
+
+
+def test_a_new_provider_speaks_an_old_recording_again(here, ollama, provider):
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--voice", VOICE]) == 0
+    assert main(["speak", "Hello.", "-o", "a.wav", "--voice", VOICE]) == 0
+
+    assert len(provider.requests) == 1
+    assert companion(here / "a.wav")["provider"] == "elevenlabs"
+
+    assert main(["speak", "Hello.", "-o", "a.wav", "--provider", "ollama", "--voice", VOICE]) == 0
+    assert len(ollama.requests) == 2
+    assert companion(here / "a.wav")["provider"] == "ollama"

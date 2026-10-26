@@ -235,6 +235,16 @@ Run `skills update` through the HyperFrames CLI selected above.
 If it installs skills into the home directory, copy the HyperFrames skill set into `.agents/skills/` instead.
 Write the agent instructions in `AGENTS.md` only; do not add a `CLAUDE.md`.
 
-`speak`, `transcribe`, and `voices` call ElevenLabs. They read
+`speak`, `transcribe`, and `voices` call ElevenLabs by default; they read
 `ELEVENLABS_API_KEY`, and `speak` without `--voice` reads `ELEVENLABS_VOICE_ID`,
 from the environment only and refuse in one line when a variable is missing. Lumiere reads no `.env` file.
+
+`speak --provider ollama` speaks with a local Ollama speech model instead: it
+requires Ollama v0.40.9+ and `ollama pull phonon`, and honors `OLLAMA_HOST`
+(default `http://localhost:11434`). It needs no API key; `--voice` names a
+local voice as `ollama show phonon` lists them (omit it and the model speaks
+with its own default voice). The local model takes no `--speed` and no
+`--previous`/`--next`, and the text is capped at 4,096 characters, so those
+invocations refuse in one line rather than speak. `transcribe` and `voices`
+always call ElevenLabs; the `ELEVENLABS_*` variables are only consulted for
+the `elevenlabs` provider.

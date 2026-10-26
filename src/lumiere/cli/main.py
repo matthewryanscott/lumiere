@@ -17,7 +17,9 @@ from typing import NoReturn
 
 import requests
 
-from lumiere.adapters.elevenlabs import TTS_MODEL, MissingApiKey, voice_from_env
+from lumiere.adapters import ollama
+from lumiere.adapters.ollama import TooLong
+from lumiere.adapters.elevenlabs import MissingApiKey, voice_from_env
 from lumiere.adapters.hyperframes import MissingTool, ToolFailed, toolchain
 from lumiere.cli.build import build, build_composition
 from lumiere.cli.bundle import AUDIO_ENCODINGS, MissingMedia, bundle, watch_server
@@ -141,7 +143,13 @@ def _run(argv: list[str] | None) -> int:
         help="the spoken audio, a .wav file; a.wav.json records how it was made",
     )
     speak_command.add_argument(
-        "--voice", help="ElevenLabs voice id (default: ELEVENLABS_VOICE_ID)",
+        "--voice", help="the model's voice; for ElevenLabs the voice id "
+                        "(default: ELEVENLABS_VOICE_ID)",
+    )
+    speak_command.add_argument(
+        "--provider", choices=("elevenlabs", "ollama"), default="elevenlabs",
+        help="the speech provider: ElevenLabs in the cloud, or a local Ollama "
+             "speech model",
     )
     for side, where in (("previous", "before"), ("next", "after")):
         neighbour = speak_command.add_mutually_exclusive_group()
@@ -159,8 +167,8 @@ def _run(argv: list[str] | None) -> int:
              "(default: none)",
     )
     speak_command.add_argument(
-        "--model", type=speech_model, default=TTS_MODEL,
-        help=f"ElevenLabs model id (default: {TTS_MODEL})",
+        "--model", type=speech_model, default=None,
+        help="model id (default: the provider's)",
     )
     speak_command.add_argument(
         "--speed", type=speech_speed,
@@ -426,9 +434,25 @@ def _run(argv: list[str] | None) -> int:
             speak_command.error(f"{args.output}: speak writes WAV; name the output .wav")
         if not args.output.parent.is_dir():
             speak_command.error(f"{args.output}: no such directory {args.output.parent}")
-        voice = args.voice or voice_from_env()
-        if not voice:
-            _refuse_in_one_line(speak_command, "give --voice or set ELEVENLABS_VOICE_ID")
+        ollama_provider = args.provider == "ollama"
+        if ollama_provider and args.speed is not None:
+            _refuse_in_one_line(
+                speak_command, "--speed is not a phonon setting; leave it out"
+            )
+        if ollama_provider and (args.previous is not None or args.previous_file is not None
+                                or args.next is not None or args.next_file is not None):
+            _refuse_in_one_line(
+                speak_command,
+                "phonon takes no neighbour context; leave out --previous and --next",
+            )
+        if ollama_provider:
+            voice = args.voice  # a local model's voice is optional, never from the environment
+        else:
+            voice = args.voice or voice_from_env()
+            if not voice:
+                _refuse_in_one_line(
+                    speak_command, "give --voice or set ELEVENLABS_VOICE_ID"
+                )
         text_file = Path("-") if args.text == "-" else args.text_file
         read_files = [p for p in (text_file, args.previous_file, args.next_file) if p is not None]
         if sum(str(path) == "-" for path in read_files) > 1:
@@ -455,13 +479,18 @@ def _run(argv: list[str] | None) -> int:
                 previous_text=given(args.previous, args.previous_file),
                 next_text=given(args.next, args.next_file),
                 lexicon=lexicon, speed=args.speed, force=args.force, model=args.model,
+                provider=args.provider,
             )
+        except MissingApiKey as missing:
+            _refuse_in_one_line(speak_command, _one_line(missing))
+        except TooLong as too_long:
+            # Text over the cap is bad input: refused in one line, nothing
+            # requested.
+            _refuse_in_one_line(speak_command, _one_line(too_long))
         except ValueError as bad_input:
             # Empty or undecodable text, a malformed lexicon or companion,
             # audio speak did not make: bad input, exit 2, nothing requested.
             speak_command.error(bad_input.args[0] if bad_input.args else str(bad_input))
-        except MissingApiKey as missing:
-            _refuse_in_one_line(speak_command, _one_line(missing))
         except PROVIDER_FAILURES as failed:
             # The request was made and failed: exit 1, nothing written.
             print(f"{args.output}: the provider request failed: {_one_line(failed)}",
